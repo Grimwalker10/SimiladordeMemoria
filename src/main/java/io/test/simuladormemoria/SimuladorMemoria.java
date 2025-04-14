@@ -14,11 +14,17 @@ public class SimuladorMemoria extends Application {
     private final List<Proceso> swap = new ArrayList<>();
     private final int TAMANIO_RAM = 100;
     private String algoritmo;
+    private String algoritmoReemplazo = "LRU";
     private VBox memoriaView;
     private ComboBox<String> liberarCombo;
     private ComboBox<String> swapCombo;
+    private ComboBox<String> comboReemplazo;
     private Scene escenaMenu;
     private Scene escenaSimulacion;
+
+    private int nextFitStartIndex = 0;
+    private int clockHand = 0;
+    private long tiempoSimulacion = 0;
 
     public static void main(String[] args) {
         launch(args);
@@ -82,12 +88,22 @@ public class SimuladorMemoria extends Application {
         // Componentes de liberación
         liberarCombo = new ComboBox<>();
         Button liberarBtn = new Button("Liberar proceso");
-        liberarBtn.setOnAction(e -> liberarProcesoDesdeRAM());
+        liberarBtn.setOnAction(e -> {
+            liberarProcesoDesdeRAM();
+            moverDesdeSwapAutomatico();
+            actualizarVista();
+        });
 
         // Componentes de swap
         swapCombo = new ComboBox<>();
         Button liberarSwapBtn = new Button("Liberar de Swap");
         liberarSwapBtn.setOnAction(e -> liberarProcesoDesdeSwap());
+
+        // Configuración algoritmos
+        comboReemplazo = new ComboBox<>();
+        comboReemplazo.getItems().addAll("LRU", "FIFO", "Clock");
+        comboReemplazo.setValue("LRU");
+        comboReemplazo.setOnAction(e -> algoritmoReemplazo = comboReemplazo.getValue());
 
         // Botón de regreso
         Button regresarBtn = new Button("Regresar al Menú Principal");
@@ -106,18 +122,36 @@ public class SimuladorMemoria extends Application {
         HBox filaEntrada = new HBox(10, nombreField, tamanoField, agregarBtn);
         HBox filaLiberacion = new HBox(10, liberarCombo, liberarBtn);
         HBox filaSwap = new HBox(10, swapCombo, liberarSwapBtn);
+        HBox filaConfig = new HBox(10, new Label("Algoritmo Reemplazo:"), comboReemplazo);
 
         contenedorPrincipal.getChildren().addAll(
-                filaEntrada, filaLiberacion, memoriaView, filaSwap, regresarBtn
+                filaEntrada, filaLiberacion, filaConfig, memoriaView, filaSwap, regresarBtn
         );
 
-        escenaSimulacion = new Scene(contenedorPrincipal, 700, 500);
+        escenaSimulacion = new Scene(contenedorPrincipal, 700, 550);
+    }
+
+    private boolean nombreProcesoExiste(String nombre) {
+        // Verificar en memoria física
+        boolean existeEnRAM = memoriaFisica.stream()
+                .filter(b -> b.ocupado)
+                .anyMatch(b -> b.proceso.nombre.equals(nombre));
+
+        // Verificar en swap
+        boolean existeEnSwap = swap.stream()
+                .anyMatch(p -> p.nombre.equals(nombre));
+
+        return existeEnRAM || existeEnSwap;
     }
 
     private void agregarProceso(TextField nombreField, TextField tamanoField) {
         String nombre = nombreField.getText();
         if (nombre.isEmpty()) {
             mostrarAlerta("Error", "El nombre del proceso es requerido");
+            return;
+        }
+        if (nombreProcesoExiste(nombre)) {
+            mostrarAlerta("Error", "Ya existe un proceso con ese nombre en RAM o Swap");
             return;
         }
 
@@ -152,6 +186,14 @@ public class SimuladorMemoria extends Application {
         }
     }
 
+    private int obtenerMaximoBloqueLibre() {
+        return memoriaFisica.stream()
+                .filter(b -> !b.ocupado)
+                .mapToInt(b -> b.tamano)
+                .max()
+                .orElse(0);
+    }
+
     private boolean asignarProceso(Proceso proceso) {
         return switch (algoritmo) {
             case "First Fit" -> asignarFirstFit(proceso);
@@ -163,30 +205,94 @@ public class SimuladorMemoria extends Application {
     }
 
     private boolean liberarEspacioParaProceso(int tamanoRequerido) {
+        while (obtenerMaximoBloqueLibre() < tamanoRequerido) {
+            Proceso victima = seleccionarVictima();
+            if (victima == null) return false;
+
+            swap.add(victima);
+            liberarProcesoDesdeRAM(victima.nombre);
+            fusionarBloquesLibres();
+        }
+        return true;
+    }
+
+    private void liberarProcesoDesdeRAM() {
+        String nombre = liberarCombo.getValue();
+        if (nombre != null) {
+            liberarProcesoDesdeRAM(nombre);
+            moverDesdeSwapAutomatico();
+            actualizarVista();
+        }
+    }
+
+    private void liberarProcesoDesdeRAM(String nombre) {
+        memoriaFisica.stream()
+                .filter(b -> b.ocupado && b.proceso.nombre.equals(nombre))
+                .findFirst()
+                .ifPresent(b -> {
+                    b.ocupado = false;
+                    b.proceso = null;
+                    fusionarBloquesLibres();
+                });
+    }
+
+    private Proceso seleccionarVictima() {
         List<Proceso> procesosEnRAM = new ArrayList<>();
         for (BloqueMemoria bloque : memoriaFisica) {
             if (bloque.ocupado) procesosEnRAM.add(bloque.proceso);
         }
+        if (procesosEnRAM.isEmpty()) return null;
 
-        procesosEnRAM.sort((p1, p2) -> Integer.compare(p2.tamano, p1.tamano));
-
-        for (Proceso proceso : procesosEnRAM) {
-            swap.add(proceso);
-            liberarProcesoDesdeRAM(proceso.nombre);
-            fusionarBloquesLibres();
-
-            if (obtenerMaximoBloqueLibre() >= tamanoRequerido) {
-                return true;
-            }
-        }
-        return false;
+        return switch (algoritmoReemplazo) {
+            case "LRU" -> seleccionarLRU(procesosEnRAM);
+            case "FIFO" -> seleccionarFIFO(procesosEnRAM);
+            case "Clock" -> seleccionarClock();
+            default -> null;
+        };
     }
 
-    private int obtenerMaximoBloqueLibre() {
-        return memoriaFisica.stream()
-                .filter(b -> !b.ocupado)
-                .mapToInt(b -> b.tamano)
-                .max().orElse(0);
+    private Proceso seleccionarLRU(List<Proceso> procesos) {
+        return procesos.stream()
+                .min(Comparator.comparingLong(p -> p.lastAccessed))
+                .orElse(null);
+    }
+
+    private Proceso seleccionarFIFO(List<Proceso> procesos) {
+        return procesos.stream()
+                .min(Comparator.comparingLong(p -> p.loadTime))
+                .orElse(null);
+    }
+
+    private Proceso seleccionarClock() {
+        if (memoriaFisica.isEmpty()) return null;
+
+        int size = memoriaFisica.size();
+        int intentos = 0;
+
+        while (intentos < 2 * size) {
+            BloqueMemoria bloque = memoriaFisica.get(clockHand);
+            if (bloque.ocupado) {
+                Proceso p = bloque.proceso;
+                if (!p.referenceBit) {
+                    // Encontramos víctima
+                    clockHand = (clockHand + 1) % size;
+                    return p;
+                } else {
+                    // Dar segunda oportunidad
+                    p.referenceBit = false;
+                }
+            }
+            clockHand = (clockHand + 1) % size;
+            intentos++;
+        }
+
+        // Fallback: seleccionar el primero ocupado
+        for (BloqueMemoria bloque : memoriaFisica) {
+            if (bloque.ocupado) {
+                return bloque.proceso;
+            }
+        }
+        return null;
     }
 
     private boolean asignarFirstFit(Proceso proceso) {
@@ -232,38 +338,33 @@ public class SimuladorMemoria extends Application {
     }
 
     private boolean asignarNextFit(Proceso proceso) {
-        return asignarFirstFit(proceso);
+        int size = memoriaFisica.size();
+        for (int i = 0; i < size; i++) {
+            int idx = (nextFitStartIndex + i) % size;
+            BloqueMemoria bloque = memoriaFisica.get(idx);
+            if (!bloque.ocupado && bloque.tamano >= proceso.tamano) {
+                dividirBloque(bloque, proceso);
+                nextFitStartIndex = (idx + 1) % size;
+                return true;
+            }
+        }
+        return false;
     }
 
     private void dividirBloque(BloqueMemoria original, Proceso proceso) {
         int indice = memoriaFisica.indexOf(original);
         BloqueMemoria ocupado = new BloqueMemoria(original.inicio, proceso.tamano, proceso);
 
+        proceso.lastAccessed = tiempoSimulacion;
+        proceso.loadTime = (algoritmoReemplazo.equals("FIFO")) ? tiempoSimulacion : proceso.loadTime;
+        proceso.referenceBit = true;
+        tiempoSimulacion++;
+
         original.inicio += proceso.tamano;
         original.tamano -= proceso.tamano;
 
         if (original.tamano == 0) memoriaFisica.remove(original);
         memoriaFisica.add(indice, ocupado);
-    }
-
-    private void liberarProcesoDesdeRAM() {
-        String nombre = liberarCombo.getValue();
-        if (nombre != null) {
-            liberarProcesoDesdeRAM(nombre);
-            moverDesdeSwapAutomatico();
-            actualizarVista();
-        }
-    }
-
-    private void liberarProcesoDesdeRAM(String nombre) {
-        memoriaFisica.stream()
-                .filter(b -> b.ocupado && b.proceso.nombre.equals(nombre))
-                .findFirst()
-                .ifPresent(b -> {
-                    b.ocupado = false;
-                    b.proceso = null;
-                    fusionarBloquesLibres();
-                });
     }
 
     private void liberarProcesoDesdeSwap() {
@@ -282,8 +383,10 @@ public class SimuladorMemoria extends Application {
             Proceso p = it.next();
             if (p.tamano > TAMANIO_RAM) continue;
 
-            boolean asignado = asignarProceso(p);
-            if (asignado) {
+            if (asignarProceso(p)) {
+                p.lastAccessed = tiempoSimulacion;
+                p.referenceBit = true;
+                tiempoSimulacion++;
                 it.remove();
                 algunMovido = true;
             }
@@ -312,7 +415,7 @@ public class SimuladorMemoria extends Application {
         liberarCombo.getItems().clear();
         swapCombo.getItems().clear();
 
-        // Mostrar RAM
+        // RAM
         memoriaView.getChildren().add(new Label("Memoria RAM (" + TAMANIO_RAM + " KB):"));
         for (BloqueMemoria bloque : memoriaFisica) {
             Label etiqueta = new Label(bloque.toString());
@@ -323,7 +426,7 @@ public class SimuladorMemoria extends Application {
             if (bloque.ocupado) liberarCombo.getItems().add(bloque.proceso.nombre);
         }
 
-        // Mostrar Swap
+        // Swap
         memoriaView.getChildren().add(new Label("\nMemoria Swap:"));
         if (swap.isEmpty()) {
             memoriaView.getChildren().add(new Label("(Vacía)"));
@@ -340,6 +443,9 @@ public class SimuladorMemoria extends Application {
     private void inicializarMemoria() {
         memoriaFisica.clear();
         memoriaFisica.add(new BloqueMemoria(0, TAMANIO_RAM));
+        nextFitStartIndex = 0;
+        clockHand = 0;
+        tiempoSimulacion = 0;
     }
 
     private void mostrarAlerta(String titulo, String mensaje) {
@@ -353,10 +459,16 @@ public class SimuladorMemoria extends Application {
     static class Proceso {
         String nombre;
         int tamano;
+        long lastAccessed;
+        long loadTime;
+        boolean referenceBit;
 
         Proceso(String nombre, int tamano) {
             this.nombre = nombre;
             this.tamano = tamano;
+            this.lastAccessed = 0;
+            this.loadTime = 0;
+            this.referenceBit = false;
         }
 
         @Override
