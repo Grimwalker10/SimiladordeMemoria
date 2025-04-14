@@ -89,9 +89,6 @@ public class SimuladorMemoria extends Application {
         Button liberarSwapBtn = new Button("Liberar de Swap");
         liberarSwapBtn.setOnAction(e -> liberarProcesoDesdeSwap());
 
-        Button moverSwapBtn = new Button("Mover desde Swap");
-        moverSwapBtn.setOnAction(e -> moverDesdeSwap());
-
         // Botón de regreso
         Button regresarBtn = new Button("Regresar al Menú Principal");
         regresarBtn.setOnAction(e -> {
@@ -107,7 +104,7 @@ public class SimuladorMemoria extends Application {
 
         // Organización de componentes
         HBox filaEntrada = new HBox(10, nombreField, tamanoField, agregarBtn);
-        HBox filaLiberacion = new HBox(10, liberarCombo, liberarBtn, moverSwapBtn);
+        HBox filaLiberacion = new HBox(10, liberarCombo, liberarBtn);
         HBox filaSwap = new HBox(10, swapCombo, liberarSwapBtn);
 
         contenedorPrincipal.getChildren().addAll(
@@ -132,29 +129,18 @@ public class SimuladorMemoria extends Application {
             }
 
             Proceso nuevo = new Proceso(nombre, tam);
-            boolean asignado = false;
-
-            switch (algoritmo) {
-                case "First Fit": asignado = asignarFirstFit(nuevo); break;
-                case "Best Fit": asignado = asignarBestFit(nuevo); break;
-                case "Worst Fit": asignado = asignarWorstFit(nuevo); break;
-                case "Next Fit": asignado = asignarNextFit(nuevo); break;
-            }
+            boolean asignado = asignarProceso(nuevo);
 
             if (!asignado) {
                 if (liberarEspacioParaProceso(nuevo.tamano)) {
-                    switch (algoritmo) {
-                        case "First Fit": asignado = asignarFirstFit(nuevo); break;
-                        case "Best Fit": asignado = asignarBestFit(nuevo); break;
-                        case "Worst Fit": asignado = asignarWorstFit(nuevo); break;
-                        case "Next Fit": asignado = asignarNextFit(nuevo); break;
-                    }
+                    asignado = asignarProceso(nuevo);
                 }
             }
 
             if (!asignado) {
                 swap.add(nuevo);
                 mostrarAlerta("Info", "Proceso movido a Swap");
+                moverDesdeSwapAutomatico();
             }
 
             nombreField.clear();
@@ -166,12 +152,20 @@ public class SimuladorMemoria extends Application {
         }
     }
 
+    private boolean asignarProceso(Proceso proceso) {
+        return switch (algoritmo) {
+            case "First Fit" -> asignarFirstFit(proceso);
+            case "Best Fit" -> asignarBestFit(proceso);
+            case "Worst Fit" -> asignarWorstFit(proceso);
+            case "Next Fit" -> asignarNextFit(proceso);
+            default -> false;
+        };
+    }
+
     private boolean liberarEspacioParaProceso(int tamanoRequerido) {
         List<Proceso> procesosEnRAM = new ArrayList<>();
         for (BloqueMemoria bloque : memoriaFisica) {
-            if (bloque.ocupado) {
-                procesosEnRAM.add(bloque.proceso);
-            }
+            if (bloque.ocupado) procesosEnRAM.add(bloque.proceso);
         }
 
         procesosEnRAM.sort((p1, p2) -> Integer.compare(p2.tamano, p1.tamano));
@@ -192,8 +186,7 @@ public class SimuladorMemoria extends Application {
         return memoriaFisica.stream()
                 .filter(b -> !b.ocupado)
                 .mapToInt(b -> b.tamano)
-                .max()
-                .orElse(0);
+                .max().orElse(0);
     }
 
     private boolean asignarFirstFit(Proceso proceso) {
@@ -244,19 +237,12 @@ public class SimuladorMemoria extends Application {
 
     private void dividirBloque(BloqueMemoria original, Proceso proceso) {
         int indice = memoriaFisica.indexOf(original);
-        BloqueMemoria ocupado = new BloqueMemoria(
-                original.inicio,
-                proceso.tamano,
-                proceso
-        );
+        BloqueMemoria ocupado = new BloqueMemoria(original.inicio, proceso.tamano, proceso);
 
         original.inicio += proceso.tamano;
         original.tamano -= proceso.tamano;
 
-        if (original.tamano == 0) {
-            memoriaFisica.remove(original);
-        }
-
+        if (original.tamano == 0) memoriaFisica.remove(original);
         memoriaFisica.add(indice, ocupado);
     }
 
@@ -264,6 +250,7 @@ public class SimuladorMemoria extends Application {
         String nombre = liberarCombo.getValue();
         if (nombre != null) {
             liberarProcesoDesdeRAM(nombre);
+            moverDesdeSwapAutomatico();
             actualizarVista();
         }
     }
@@ -287,35 +274,22 @@ public class SimuladorMemoria extends Application {
         }
     }
 
-    private void moverDesdeSwap() {
+    private void moverDesdeSwapAutomatico() {
         Iterator<Proceso> it = swap.iterator();
         boolean algunMovido = false;
 
         while (it.hasNext()) {
             Proceso p = it.next();
-            boolean asignado = false;
+            if (p.tamano > TAMANIO_RAM) continue;
 
-            switch (algoritmo) {
-                case "First Fit": asignado = asignarFirstFit(p); break;
-                case "Best Fit": asignado = asignarBestFit(p); break;
-                case "Worst Fit": asignado = asignarWorstFit(p); break;
-                case "Next Fit": asignado = asignarNextFit(p); break;
-            }
-
+            boolean asignado = asignarProceso(p);
             if (asignado) {
                 it.remove();
                 algunMovido = true;
-            } else {
-                if (p.tamano > TAMANIO_RAM) {
-                    mostrarAlerta("Error", "Proceso " + p.nombre + " demasiado grande para RAM");
-                }
             }
         }
 
-        if (!algunMovido && !swap.isEmpty()) {
-            mostrarAlerta("Info", "No hay espacio suficiente en RAM para los procesos en Swap");
-        }
-        actualizarVista();
+        if (algunMovido) actualizarVista();
     }
 
     private void fusionarBloquesLibres() {
@@ -342,15 +316,11 @@ public class SimuladorMemoria extends Application {
         memoriaView.getChildren().add(new Label("Memoria RAM (" + TAMANIO_RAM + " KB):"));
         for (BloqueMemoria bloque : memoriaFisica) {
             Label etiqueta = new Label(bloque.toString());
-            String estilo = bloque.ocupado ?
-                    "-fx-background-color: lightgreen;" :
-                    "-fx-background-color: lightgray;";
-            etiqueta.setStyle("-fx-border-color: black; -fx-padding: 5;" + estilo);
+            etiqueta.setStyle("-fx-border-color: black; -fx-padding: 5; " +
+                    (bloque.ocupado ? "-fx-background-color: lightgreen;" : "-fx-background-color: lightgray;"));
             memoriaView.getChildren().add(etiqueta);
 
-            if (bloque.ocupado) {
-                liberarCombo.getItems().add(bloque.proceso.nombre);
-            }
+            if (bloque.ocupado) liberarCombo.getItems().add(bloque.proceso.nombre);
         }
 
         // Mostrar Swap
@@ -415,10 +385,7 @@ public class SimuladorMemoria extends Application {
         @Override
         public String toString() {
             return String.format("%s | Inicio: %d | Tamaño: %d KB",
-                    (ocupado ? proceso.nombre : "Libre"),
-                    inicio,
-                    tamano
-            );
+                    (ocupado ? proceso.nombre : "Libre"), inicio, tamano);
         }
     }
 }
