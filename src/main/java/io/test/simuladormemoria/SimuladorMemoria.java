@@ -38,6 +38,8 @@ public class SimuladorMemoria extends Application {
     }
 
     private void crearMenuPrincipal(Stage primaryStage) {
+        Label nombre = new Label("Nombre: Diego José Lutín Miranda");
+        Label carnet = new Label("Carnet: 5190-20-16218");
         VBox mainMenu = new VBox(20);
         mainMenu.setAlignment(Pos.CENTER);
         mainMenu.setPadding(new Insets(20));
@@ -52,6 +54,8 @@ public class SimuladorMemoria extends Application {
         Button salirBtn = new Button("Salir");
         salirBtn.setOnAction(e -> primaryStage.close());
 
+        mainMenu.getChildren().add(nombre);
+        mainMenu.getChildren().add(carnet);
         mainMenu.getChildren().addAll(botonesAlgoritmos);
         mainMenu.getChildren().add(salirBtn);
 
