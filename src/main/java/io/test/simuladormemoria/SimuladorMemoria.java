@@ -7,12 +7,14 @@ import javafx.scene.layout.*;
 import javafx.stage.Stage;
 import javafx.geometry.*;
 import java.util.*;
+import java.util.stream.Collectors;
 
 public class SimuladorMemoria extends Application {
 
     private final List<BloqueMemoria> memoriaFisica = new ArrayList<>();
     private final List<Proceso> swap = new ArrayList<>();
     private final int TAMANIO_RAM = 100;
+    private final int PAGE_SIZE = 10; // Tamaño de página en KB
     private String algoritmo;
     private String algoritmoReemplazo = "LRU";
     private VBox memoriaView;
@@ -22,7 +24,6 @@ public class SimuladorMemoria extends Application {
     private Scene escenaMenu;
     private Scene escenaSimulacion;
 
-    private int nextFitStartIndex = 0;
     private int clockHand = 0;
     private long tiempoSimulacion = 0;
 
@@ -38,8 +39,6 @@ public class SimuladorMemoria extends Application {
     }
 
     private void crearMenuPrincipal(Stage primaryStage) {
-        Label nombre = new Label("Nombre: Diego José Lutín Miranda");
-        Label carnet = new Label("Carnet: 5190-20-16218");
         VBox mainMenu = new VBox(20);
         mainMenu.setAlignment(Pos.CENTER);
         mainMenu.setPadding(new Insets(20));
@@ -54,8 +53,6 @@ public class SimuladorMemoria extends Application {
         Button salirBtn = new Button("Salir");
         salirBtn.setOnAction(e -> primaryStage.close());
 
-        mainMenu.getChildren().add(nombre);
-        mainMenu.getChildren().add(carnet);
         mainMenu.getChildren().addAll(botonesAlgoritmos);
         mainMenu.getChildren().add(salirBtn);
 
@@ -136,13 +133,14 @@ public class SimuladorMemoria extends Application {
     }
 
     private boolean nombreProcesoExiste(String nombre) {
-        // Verificar en memoria física
+        // Verificar en memoria física (incluye filtro de null)
         boolean existeEnRAM = memoriaFisica.stream()
-                .filter(b -> b.ocupado)
+                .filter(b -> b.isOcupado() && b.proceso != null)
                 .anyMatch(b -> b.proceso.nombre.equals(nombre));
 
-        // Verificar en swap
+        // Verificar en swap (filtra procesos null)
         boolean existeEnSwap = swap.stream()
+                .filter(Objects::nonNull)  // Filtra elementos null
                 .anyMatch(p -> p.nombre.equals(nombre));
 
         return existeEnRAM || existeEnSwap;
@@ -167,18 +165,26 @@ public class SimuladorMemoria extends Application {
             }
 
             Proceso nuevo = new Proceso(nombre, tam);
-            boolean asignado = asignarProceso(nuevo);
+            int paginasRequeridas = nuevo.paginas.size();
 
-            if (!asignado) {
-                if (liberarEspacioParaProceso(nuevo.tamano)) {
-                    asignado = asignarProceso(nuevo);
+            List<BloqueMemoria> marcosLibres = memoriaFisica.stream()
+                    .filter(b -> !b.isOcupado())
+                    .collect(Collectors.toList());
+
+            if (marcosLibres.size() >= paginasRequeridas) {
+                asignarMarcos(nuevo, marcosLibres);
+            } else {
+                int marcosNecesarios = paginasRequeridas - marcosLibres.size();
+                List<BloqueMemoria> victimas = seleccionarVictimas(marcosNecesarios);
+                if (victimas.size() < marcosNecesarios) {
+                    swap.add(nuevo);
+                    mostrarAlerta("Info", "Proceso movido a Swap");
+                } else {
+                    liberarVictimas(victimas);
+                    asignarMarcos(nuevo, memoriaFisica.stream()
+                            .filter(b -> !b.isOcupado())
+                            .collect(Collectors.toList()));
                 }
-            }
-
-            if (!asignado) {
-                swap.add(nuevo);
-                mostrarAlerta("Info", "Proceso movido a Swap");
-                moverDesdeSwapAutomatico();
             }
 
             nombreField.clear();
@@ -190,185 +196,75 @@ public class SimuladorMemoria extends Application {
         }
     }
 
-    private int obtenerMaximoBloqueLibre() {
-        return memoriaFisica.stream()
-                .filter(b -> !b.ocupado)
-                .mapToInt(b -> b.tamano)
-                .max()
-                .orElse(0);
-    }
-
-    private boolean asignarProceso(Proceso proceso) {
-        return switch (algoritmo) {
-            case "First Fit" -> asignarFirstFit(proceso);
-            case "Best Fit" -> asignarBestFit(proceso);
-            case "Worst Fit" -> asignarWorstFit(proceso);
-            case "Next Fit" -> asignarNextFit(proceso);
-            default -> false;
-        };
-    }
-
-    private boolean liberarEspacioParaProceso(int tamanoRequerido) {
-        while (obtenerMaximoBloqueLibre() < tamanoRequerido) {
-            Proceso victima = seleccionarVictima();
-            if (victima == null) return false;
-
-            swap.add(victima);
-            liberarProcesoDesdeRAM(victima.nombre);
-            fusionarBloquesLibres();
+    private void asignarMarcos(Proceso proceso, List<BloqueMemoria> marcos) {
+        for (int i = 0; i < proceso.paginas.size() && i < marcos.size(); i++) {
+            BloqueMemoria marco = marcos.get(i);
+            marco.asignar(proceso, i);
+            proceso.paginas.get(i).marco = marco;
+            marco.lastAccessed = tiempoSimulacion++;
+            marco.loadTime = tiempoSimulacion;
+            marco.referenceBit = true;
         }
-        return true;
+    }
+
+    private List<BloqueMemoria> seleccionarVictimas(int cantidad) {
+        List<BloqueMemoria> candidatos = memoriaFisica.stream()
+                .filter(BloqueMemoria::isOcupado)
+                .collect(Collectors.toList());
+
+        switch (algoritmoReemplazo) {
+            case "LRU":
+                candidatos.sort(Comparator.comparingLong(b -> b.lastAccessed));
+                break;
+            case "FIFO":
+                candidatos.sort(Comparator.comparingLong(b -> b.loadTime));
+                break;
+            case "Clock":
+                return seleccionarVictimasClock(cantidad);
+        }
+
+        return candidatos.subList(0, Math.min(cantidad, candidatos.size()));
+    }
+
+    private List<BloqueMemoria> seleccionarVictimasClock(int cantidad) {
+        List<BloqueMemoria> victimas = new ArrayList<>();
+        int intentos = 0;
+        while (victimas.size() < cantidad && intentos < 2 * memoriaFisica.size()) {
+            BloqueMemoria marco = memoriaFisica.get(clockHand);
+            if (marco.isOcupado()) {
+                if (!marco.referenceBit) {
+                    victimas.add(marco);
+                } else {
+                    marco.referenceBit = false;
+                }
+            }
+            clockHand = (clockHand + 1) % memoriaFisica.size();
+            intentos++;
+        }
+        return victimas;
+    }
+
+    private void liberarVictimas(List<BloqueMemoria> victimas) {
+        for (BloqueMemoria victima : victimas) {
+            Proceso proc = victima.proceso;
+            if (proc != null) {  // Validación clave
+                swap.add(proc);
+                memoriaFisica.stream()
+                        .filter(b -> b.proceso != null && b.proceso.nombre.equals(proc.nombre))
+                        .forEach(BloqueMemoria::liberar);
+            }
+        }
     }
 
     private void liberarProcesoDesdeRAM() {
         String nombre = liberarCombo.getValue();
         if (nombre != null) {
-            liberarProcesoDesdeRAM(nombre);
-            moverDesdeSwapAutomatico();
+            memoriaFisica.stream()
+                    .filter(b -> b.isOcupado() && b.proceso.nombre.equals(nombre))
+                    .forEach(BloqueMemoria::liberar);
+            swap.removeIf(p -> p.nombre.equals(nombre));
             actualizarVista();
         }
-    }
-
-    private void liberarProcesoDesdeRAM(String nombre) {
-        memoriaFisica.stream()
-                .filter(b -> b.ocupado && b.proceso.nombre.equals(nombre))
-                .findFirst()
-                .ifPresent(b -> {
-                    b.ocupado = false;
-                    b.proceso = null;
-                    fusionarBloquesLibres();
-                });
-    }
-
-    private Proceso seleccionarVictima() {
-        List<Proceso> procesosEnRAM = new ArrayList<>();
-        for (BloqueMemoria bloque : memoriaFisica) {
-            if (bloque.ocupado) procesosEnRAM.add(bloque.proceso);
-        }
-        if (procesosEnRAM.isEmpty()) return null;
-
-        return switch (algoritmoReemplazo) {
-            case "LRU" -> seleccionarLRU(procesosEnRAM);
-            case "FIFO" -> seleccionarFIFO(procesosEnRAM);
-            case "Clock" -> seleccionarClock();
-            default -> null;
-        };
-    }
-
-    private Proceso seleccionarLRU(List<Proceso> procesos) {
-        return procesos.stream()
-                .min(Comparator.comparingLong(p -> p.lastAccessed))
-                .orElse(null);
-    }
-
-    private Proceso seleccionarFIFO(List<Proceso> procesos) {
-        return procesos.stream()
-                .min(Comparator.comparingLong(p -> p.loadTime))
-                .orElse(null);
-    }
-
-    private Proceso seleccionarClock() {
-        if (memoriaFisica.isEmpty()) return null;
-
-        int size = memoriaFisica.size();
-        int intentos = 0;
-
-        while (intentos < 2 * size) {
-            BloqueMemoria bloque = memoriaFisica.get(clockHand);
-            if (bloque.ocupado) {
-                Proceso p = bloque.proceso;
-                if (!p.referenceBit) {
-                    // Encontramos víctima
-                    clockHand = (clockHand + 1) % size;
-                    return p;
-                } else {
-                    // Dar segunda oportunidad
-                    p.referenceBit = false;
-                }
-            }
-            clockHand = (clockHand + 1) % size;
-            intentos++;
-        }
-
-        // Fallback: seleccionar el primero ocupado
-        for (BloqueMemoria bloque : memoriaFisica) {
-            if (bloque.ocupado) {
-                return bloque.proceso;
-            }
-        }
-        return null;
-    }
-
-    private boolean asignarFirstFit(Proceso proceso) {
-        for (BloqueMemoria bloque : memoriaFisica) {
-            if (!bloque.ocupado && bloque.tamano >= proceso.tamano) {
-                dividirBloque(bloque, proceso);
-                return true;
-            }
-        }
-        return false;
-    }
-
-    private boolean asignarBestFit(Proceso proceso) {
-        BloqueMemoria mejor = null;
-        for (BloqueMemoria bloque : memoriaFisica) {
-            if (!bloque.ocupado && bloque.tamano >= proceso.tamano) {
-                if (mejor == null || bloque.tamano < mejor.tamano) {
-                    mejor = bloque;
-                }
-            }
-        }
-        if (mejor != null) {
-            dividirBloque(mejor, proceso);
-            return true;
-        }
-        return false;
-    }
-
-    private boolean asignarWorstFit(Proceso proceso) {
-        BloqueMemoria peor = null;
-        for (BloqueMemoria bloque : memoriaFisica) {
-            if (!bloque.ocupado && bloque.tamano >= proceso.tamano) {
-                if (peor == null || bloque.tamano > peor.tamano) {
-                    peor = bloque;
-                }
-            }
-        }
-        if (peor != null) {
-            dividirBloque(peor, proceso);
-            return true;
-        }
-        return false;
-    }
-
-    private boolean asignarNextFit(Proceso proceso) {
-        int size = memoriaFisica.size();
-        for (int i = 0; i < size; i++) {
-            int idx = (nextFitStartIndex + i) % size;
-            BloqueMemoria bloque = memoriaFisica.get(idx);
-            if (!bloque.ocupado && bloque.tamano >= proceso.tamano) {
-                dividirBloque(bloque, proceso);
-                nextFitStartIndex = (idx + 1) % size;
-                return true;
-            }
-        }
-        return false;
-    }
-
-    private void dividirBloque(BloqueMemoria original, Proceso proceso) {
-        int indice = memoriaFisica.indexOf(original);
-        BloqueMemoria ocupado = new BloqueMemoria(original.inicio, proceso.tamano, proceso);
-
-        proceso.lastAccessed = tiempoSimulacion;
-        proceso.loadTime = (algoritmoReemplazo.equals("FIFO")) ? tiempoSimulacion : proceso.loadTime;
-        proceso.referenceBit = true;
-        tiempoSimulacion++;
-
-        original.inicio += proceso.tamano;
-        original.tamano -= proceso.tamano;
-
-        if (original.tamano == 0) memoriaFisica.remove(original);
-        memoriaFisica.add(indice, ocupado);
     }
 
     private void liberarProcesoDesdeSwap() {
@@ -381,35 +277,14 @@ public class SimuladorMemoria extends Application {
 
     private void moverDesdeSwapAutomatico() {
         Iterator<Proceso> it = swap.iterator();
-        boolean algunMovido = false;
-
         while (it.hasNext()) {
             Proceso p = it.next();
-            if (p.tamano > TAMANIO_RAM) continue;
-
-            if (asignarProceso(p)) {
-                p.lastAccessed = tiempoSimulacion;
-                p.referenceBit = true;
-                tiempoSimulacion++;
+            List<BloqueMemoria> marcosLibres = memoriaFisica.stream()
+                    .filter(b -> !b.isOcupado())
+                    .collect(Collectors.toList());
+            if (marcosLibres.size() >= p.paginas.size()) {
+                asignarMarcos(p, marcosLibres);
                 it.remove();
-                algunMovido = true;
-            }
-        }
-
-        if (algunMovido) actualizarVista();
-    }
-
-    private void fusionarBloquesLibres() {
-        ListIterator<BloqueMemoria> it = memoriaFisica.listIterator();
-        BloqueMemoria anterior = null;
-
-        while (it.hasNext()) {
-            BloqueMemoria actual = it.next();
-            if (anterior != null && !anterior.ocupado && !actual.ocupado) {
-                anterior.tamano += actual.tamano;
-                it.remove();
-            } else {
-                anterior = actual;
             }
         }
     }
@@ -421,21 +296,23 @@ public class SimuladorMemoria extends Application {
 
         // RAM
         memoriaView.getChildren().add(new Label("Memoria RAM (" + TAMANIO_RAM + " KB):"));
-        for (BloqueMemoria bloque : memoriaFisica) {
-            Label etiqueta = new Label(bloque.toString());
+        for (BloqueMemoria marco : memoriaFisica) {
+            Label etiqueta = new Label(marco.toString());
             etiqueta.setStyle("-fx-border-color: black; -fx-padding: 5; " +
-                    (bloque.ocupado ? "-fx-background-color: lightgreen;" : "-fx-background-color: lightgray;"));
+                    (marco.isOcupado() ? "-fx-background-color: lightgreen;" : "-fx-background-color: lightgray;"));
             memoriaView.getChildren().add(etiqueta);
-
-            if (bloque.ocupado) liberarCombo.getItems().add(bloque.proceso.nombre);
+            if (marco.isOcupado()) {
+                liberarCombo.getItems().add(marco.proceso.nombre);
+            }
         }
 
-        // Swap
+        // Swap - Añadir filtro para null
         memoriaView.getChildren().add(new Label("\nMemoria Swap:"));
         if (swap.isEmpty()) {
             memoriaView.getChildren().add(new Label("(Vacía)"));
         } else {
             for (Proceso p : swap) {
+                if (p == null) continue; // Filtra procesos nulos
                 Label etiqueta = new Label(p.toString());
                 etiqueta.setStyle("-fx-border-color: red; -fx-padding: 5; -fx-background-color: #FFE4E1;");
                 memoriaView.getChildren().add(etiqueta);
@@ -446,8 +323,10 @@ public class SimuladorMemoria extends Application {
 
     private void inicializarMemoria() {
         memoriaFisica.clear();
-        memoriaFisica.add(new BloqueMemoria(0, TAMANIO_RAM));
-        nextFitStartIndex = 0;
+        int numFrames = TAMANIO_RAM / PAGE_SIZE;
+        for (int i = 0; i < numFrames; i++) {
+            memoriaFisica.add(new BloqueMemoria(i * PAGE_SIZE, PAGE_SIZE));
+        }
         clockHand = 0;
         tiempoSimulacion = 0;
     }
@@ -463,6 +342,7 @@ public class SimuladorMemoria extends Application {
     static class Proceso {
         String nombre;
         int tamano;
+        List<Pagina> paginas;
         long lastAccessed;
         long loadTime;
         boolean referenceBit;
@@ -470,9 +350,20 @@ public class SimuladorMemoria extends Application {
         Proceso(String nombre, int tamano) {
             this.nombre = nombre;
             this.tamano = tamano;
-            this.lastAccessed = 0;
-            this.loadTime = 0;
-            this.referenceBit = false;
+            this.paginas = new ArrayList<>();
+            int numPages = (tamano + 10 - 1) / 10; // PAGE_SIZE=10
+            for (int i = 0; i < numPages; i++) {
+                paginas.add(new Pagina(i));
+            }
+        }
+
+        class Pagina {
+            int numero;
+            BloqueMemoria marco;
+
+            Pagina(int numero) {
+                this.numero = numero;
+            }
         }
 
         @Override
@@ -484,24 +375,45 @@ public class SimuladorMemoria extends Application {
     static class BloqueMemoria {
         int inicio;
         int tamano;
-        boolean ocupado;
         Proceso proceso;
+        int numeroPagina;
+        long lastAccessed;
+        long loadTime;
+        boolean referenceBit;
 
         BloqueMemoria(int inicio, int tamano) {
-            this(inicio, tamano, null);
-        }
-
-        BloqueMemoria(int inicio, int tamano, Proceso proceso) {
             this.inicio = inicio;
             this.tamano = tamano;
+            this.proceso = null;
+            this.numeroPagina = -1;
+        }
+
+        boolean isOcupado() {
+            return proceso != null;
+        }
+
+        void asignar(Proceso proceso, int numeroPagina) {
             this.proceso = proceso;
-            this.ocupado = (proceso != null);
+            this.numeroPagina = numeroPagina;
+            this.lastAccessed = System.currentTimeMillis();
+            this.loadTime = this.lastAccessed;
+            this.referenceBit = true;
+        }
+
+        void liberar() {
+            this.proceso = null;
+            this.numeroPagina = -1;
+            this.referenceBit = false;
         }
 
         @Override
         public String toString() {
-            return String.format("%s | Inicio: %d | Tamaño: %d KB",
-                    (ocupado ? proceso.nombre : "Libre"), inicio, tamano);
+            if (isOcupado()) {
+                return String.format("Marco %d-%d: %s (Página %d)",
+                        inicio, inicio + tamano - 1, proceso.nombre, numeroPagina);
+            } else {
+                return String.format("Marco %d-%d: Libre", inicio, inicio + tamano - 1);
+            }
         }
     }
 }
